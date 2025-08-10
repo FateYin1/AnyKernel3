@@ -77,7 +77,14 @@ if [ -d /data/adb/magisk ] || [ -f /sbin/.magisk ]; then
 fi
 
 ui_print "开始安装内核..."
-ui_print "Power by GitHub@Numbersf(Aq1298&咿云冷雨)"
+ui_print "功能如下："
+ui_print "1、支持KPM"
+ui_print "2、LZ4 V1.10.0版本"
+ui_print "3、LZ4K"
+ui_print "4、BBR"
+ui_print "5、完美风驰驱动"
+ui_print "6、单BOOT开机"
+ui_print "作者：Fate 酷安:Fate007"
 if [ -L "/dev/block/bootdevice/by-name/init_boot_a" ] || [ -L "/dev/block/by-name/init_boot_a" ]; then
     split_boot
     flash_boot

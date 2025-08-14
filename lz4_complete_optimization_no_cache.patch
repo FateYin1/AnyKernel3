@@ -1,0 +1,324 @@
+diff --git a/kernel_platform/common/lib/lz4.c b/kernel_platform/common/lib/lz4.c
+index 6d8f4e5..a1b2c3d 100644
+--- a/kernel_platform/common/lib/lz4.c
++++ b/kernel_platform/common/lib/lz4.c
+@@ -123,7 +123,220 @@ static const int LZ4_DEFAULT_COMPRESSION_LEVEL = 3;
++#include <linux/sched/loadavg.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/sysinfo.h>   // 内存信息接口
++#include <linux/kobject.h>   // 电池信息接口
++#include <linux/ktime.h>     // 时间接口
++
++// 高通GPU接口：仅在高通平台启用
++#ifdef CONFIG_ARCH_QCOM
++#include <linux/msm_kgsl.h>  // 高通Adreno GPU专用
++#endif
++
++// 屏幕状态接口：兼容不同内核版本
++#ifdef CONFIG_FB
++#include <linux/fb.h>        // 屏幕状态接口
++#else
++static bool screen_is_on(void) { return true; }  // 默认为亮屏
++#endif
++
++// 场景类型定义（新增高负载游戏场景）
++enum scene_type {
++    SCENE_STANDBY,         // 待机场景
++    SCENE_DAILY,           // 日用场景
++    SCENE_GAME,            // 普通游戏场景
++    SCENE_HIGH_LOAD_GAME,  // 高资源消耗游戏场景（新增）
++    SCENE_MEMORY_PRESSURE, // 内存高压力场景
++    SCENE_LOW_BATTERY      // 低电量场景
++};
++
++// 游戏包名分类（按资源消耗等级划分）
++// 高资源消耗游戏（新增分类，单独优化）
+static const char *high_load_games[] = {
++    // 开放世界/3A级别
++    "com.miHoYo.Yuanshen",        // 原神（超高负载）
++    "com.netease.nie.yitian",     // 逆水寒（高负载）
++    "com.tencent.wuxia",          // 天涯明月刀（高负载）
++    "com.netease.nie.zuoqi",      // 妄想山海（高负载）
++    "com.eyougame.yjs",           // 原神渠道服
++
++    // 大型竞技/高帧率需求
++    "com.tencent.tmgp.sgame",     // 王者荣耀（团战高负载）
++    "com.tencent.tmgp.pubgmhd",   // 和平精英（百人同场）
++    "com.tencent.dawnfield",      // 暗区突围（实时光影）
++    "com.tencent.lolm",           // 英雄联盟手游（高画质模式）
++
++    // 高画质二次元
++    "com.miHoYo.HSR",             // 崩坏：星穹铁道（复杂场景）
++    "com.miHoYo.bh3",             // 崩坏3（特效密集）
++    "com.hypergryph.arknights",   // 明日方舟（复杂地图）
++    NULL
++};
++
++// 普通资源消耗游戏
++static const char *normal_games[] = {
++    // 休闲竞技
++    "com.tencent.jkchess",        // 金铲铲之战
++    "com.tencent.tmgp.speedmobile",// QQ飞车手游
++    "com.tencent.tmgp.qqfeiche",  // QQ飞车体验服
++
++    // 卡牌/回合制
++    "com.netease.onmyoji",        // 阴阳师
++    "com.bilibili.azurlane",      // 碧蓝航线
++    "com.bilibili.fgo",           // 命运-冠位指定
++    "com.tencent.az",             // 火影忍者手游
++
++    // 其他中度负载
++    "com.netease.moba",           // 决战！平安京
++    "com.tencent.tmgp.zhuxian",   // 诛仙
++    NULL
++};
++
++// 国内常用模拟器（高资源消耗场景）
++static const char *emulators[] = {
++    "com.memu.play",              // 逍遥模拟器
++    "com.ldmnq.ldplayer",         // 雷电模拟器
++    "com.netease.emu.nie",        // 网易MuMu模拟器
++    "com.bluestacks.cn",          // 蓝叠模拟器国内版
++    NULL
++};
++
++// 1. 系统负载检测
++static int get_system_load_pct(void) {
++    unsigned long avg[3];
++    get_avenrun(avg, 0, 0);
++    return (avg[0] * 100) / (1 << FSHIFT);
++}
++
++// 2. 内存使用率检测
++static int get_memory_usage_pct(void) {
++    struct sysinfo mem_info;
++    sysinfo(&mem_info);
++    unsigned long total = mem_info.totalram;
++    unsigned long free = mem_info.freeram + mem_info.bufferram + mem_info.sharedram;
++    return (total - free) * 100 / total;
++}
++
++// 3. 电池电量检测（兼容多设备）
++static int get_battery_capacity(void) {
++    struct kobject *battery = kobject_lookup_path("/sys/class/power_supply/bat0", NULL);
++    if (!battery)
++        battery = kobject_lookup_path("/sys/class/power_supply/battery", NULL);
++    if (!battery)
++        return 100;
++
++    char buf[16];
++    ssize_t ret = kobject_attr_get(battery, "capacity", buf, sizeof(buf));
++    kobject_put(battery);
++    return ret > 0 ? simple_strtol(buf, NULL, 10) : 100;
++}
++
++// 4. GPU负载检测（高通平台专用）
++static int get_gpu_load_pct(void) {
++#ifdef CONFIG_ARCH_QCOM
++    struct kgsl_device *gpu = kgsl_device_get(0);
++    if (!gpu)
++        return 0;
++
++    int load = (gpu->load / 10);
++    kgsl_device_put(gpu);
++    return load;
++#else
++    return 0;
++#endif
++}
++
++// 5. 屏幕状态检测
++#ifdef CONFIG_FB
++static bool screen_is_on(void) {
++    struct fb_info *fb = registered_fb[0];
++    if (!fb || !fb->fbops)
++        return true;
++    return fb->fbops->fb_blank(fb, FB_BLANK_UNBLANK) == 0;
++}
++#endif
++
++// 6. 用户活动检测
++static bool is_user_active(void) {
++    static unsigned long last_input_time = 0;
++    unsigned long current_time = jiffies_to_msecs(jiffies);
++    last_input_time = max(last_input_time, input_get_last_activity());
++    return (current_time - last_input_time) < 300000; // 5分钟
++}
++
++// 7. 深度待机判定
++static bool is_deep_standby(void) {
++    return !is_user_active() 
++           && !screen_is_on() 
++           && get_system_load_pct() < 5;
++}
++
++// 8. 进程匹配工具函数（通用匹配逻辑）
++static bool process_matches(const char *comm, const char * const *package_list) {
++    for (int i = 0; package_list[i]; i++) {
++        if (strstr(comm, package_list[i])) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// 9. 游戏类型识别（区分高负载/普通游戏）
++static enum scene_type detect_game_scene(void) {
++    char comm[256];
++    struct task_struct *task;
++
++    // 优先检测前台进程
++    for_each_process(task) {
++        if (!(task->flags & PF_FOREGROUND))
++            continue;
++
++        get_task_comm(comm, task);
++
++        // 检测高资源消耗游戏
++        if (process_matches(comm, high_load_games)) {
++            return SCENE_HIGH_LOAD_GAME;
++        }
++
++        // 检测普通游戏
++        if (process_matches(comm, normal_games)) {
++            return SCENE_GAME;
++        }
++
++        // 检测模拟器（按高负载游戏处理）
++        if (process_matches(comm, emulators)) {
++            return SCENE_HIGH_LOAD_GAME;
++        }
++
++        break; // 仅检测第一个前台进程
++    }
++
++    // 硬件负载辅助判断（无进程匹配时）
++    if (get_gpu_load_pct() > 80 && get_system_load_pct() > 70) {
++        return SCENE_HIGH_LOAD_GAME; // 超高硬件负载视为高资源游戏
++    } else if (get_gpu_load_pct() > 50 && get_system_load_pct() > 50) {
++        return SCENE_GAME; // 中等负载视为普通游戏
++    }
++
++    return SCENE_DAILY; // 非游戏场景
++}
++
++// 核心场景识别逻辑（强化游戏分级）
++static enum scene_type detect_current_scene(void) {
++    // 优先检测游戏场景（最高优先级）
++    enum scene_type game_scene = detect_game_scene();
++    if (game_scene != SCENE_DAILY) {
++        return game_scene;
++    }
++
++    // 内存高压力场景
++    if (get_memory_usage_pct() > 80) {
++        return SCENE_MEMORY_PRESSURE;
++    }
++
++    // 低电量场景
++    if (get_battery_capacity() < 20) {
++        return SCENE_LOW_BATTERY;
++    }
++
++    // 待机场景
++    if (is_deep_standby()) {
++        return SCENE_STANDBY;
++    }
++
++    // 默认日用场景
++    return SCENE_DAILY;
++}
++
++// 熔断机制
++static unsigned int compress_error_count = 0;
++static const unsigned int FUSE_THRESHOLD = 5;
++static bool is_fused = false;
++static struct delayed_work reset_fuse_work;
++
++static void reset_fuse_state(struct work_struct *work) {
++    compress_error_count = 0;
++    is_fused = false;
++}
++
++static int __init lz4_fuse_init(void) {
++    INIT_DELAYED_WORK(&reset_fuse_work, reset_fuse_state);
++    return 0;
++}
++late_initcall(lz4_fuse_init);
++
++static void handle_compress_error(void) {
++    compress_error_count++;
++    if (compress_error_count >= FUSE_THRESHOLD && !is_fused) {
++        is_fused = true;
++        pr_warn("LZ4 compression fuse triggered! Downgrading to safe level.\n");
++        schedule_delayed_work(&reset_fuse_work, msecs_to_jiffies(30000));
++    }
++}
++
++// 核心压缩等级计算（针对高负载游戏的特殊优化）
++static int get_final_compression_level(void) {
++    if (is_fused) {
++        return 2; // 熔断状态：最低延迟模式
++    }
++
++    int base_level = 4;
++    switch (detect_current_scene()) {
++        case SCENE_HIGH_LOAD_GAME:
++            // 高资源游戏：极致速度优先（比普通游戏更低延迟）
++            base_level = 1; 
++            // 若内存充足，可适当提升压缩率（平衡性能与内存）
++            if (get_memory_usage_pct() < 60) {
++                base_level = 2;
++            }
++            break;
++        case SCENE_GAME:
++            // 普通游戏：平衡速度
++            base_level = 2;
++            break;
++        case SCENE_MEMORY_PRESSURE:
++            // 内存压力：高压缩率
++            base_level = 7;
++            break;
++        case SCENE_LOW_BATTERY:
++            // 低电量：平衡功耗
++            base_level = 3;
++            break;
++        case SCENE_STANDBY:
++            // 待机：最高压缩率
++            base_level = 8;
++            break;
++        default:
++            // 日用：平衡
++            base_level = 4;
++            break;
++    }
++
++    // 实时负载微调：CPU过载时强制降级
++    if (get_system_load_pct() > 80) {
++        base_level = max(1, base_level - 3); // 高负载时降幅更大
++    } else if (get_system_load_pct() > 70) {
++        base_level = max(1, base_level - 2);
++    }
++
++    // 限制在LZ4支持范围（1-12）
++    return clamp_val(base_level, 1, 12);
++}
++
+ // 压缩函数入口（高负载游戏超时保护强化）
+ static int LZ4_compress(const char* source, char* dest, int sourceSize) {
++    unsigned long start_time = jiffies;
+     int result = LZ4_compress_default(source, dest, sourceSize, LZ4_COMPRESSION_LEVEL);
++    unsigned long duration = jiffies_to_msecs(jiffies - start_time);
++
++    // 高负载游戏场景超时阈值更严格（30ms）
++    bool is_high_load = (detect_current_scene() == SCENE_HIGH_LOAD_GAME);
++    if (result <= 0 || (is_high_load && duration > 30) || (!is_high_load && duration > 50)) {
++        handle_compress_error();
++        return -EIO;
++    }
+     return result;
+ }
+
+-#define LZ4_COMPRESSION_LEVEL 3
++#define LZ4_COMPRESSION_LEVEL get_final_compression_level()

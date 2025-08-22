@@ -21,101 +21,164 @@ supported.patchlevels=
 supported.vendorpatchlevels=
 '; } # end properties
 
-### ZRAM配置核心函数（默认LZ4，不自动切换ZSTD）
+### ZRAM配置核心函数（完整修复版）
 zram_config() {
   ui_print " "
-  ui_print "===== 配置ZRAM ====="
+  ui_print "===== 开始ZRAM配置 ====="
   
-  # 等待系统初始化完成
+  # 强制ROOT权限并前台执行，确保日志完整
+  if [ "$(id -u)" -ne 0 ]; then
+    ui_print "获取ROOT权限..."
+    su -c "$(declare -f zram_core_logic); zram_core_logic"
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+      ui_print "ZRAM配置失败（权限问题）"
+    fi
+    return $exit_code
+  else
+    zram_core_logic
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+      ui_print "ZRAM配置失败"
+    fi
+    return $exit_code
+  fi
+}
+
+# ZRAM核心逻辑（兼容16GB设备系统显示14GB的情况）
+zram_core_logic() {
+  # 1. 等待系统初始化
+  ui_print "1/10 等待系统设备初始化..."
   sleep 5
 
-  # 1. 获取物理内存总大小（单位：KB）
-  MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-  if [ -z "$MEM_TOTAL_KB" ]; then
-      ui_print "警告：无法获取物理内存，使用默认8GB配置"
-      MEM_TOTAL_KB=$((8 * 1024 * 1024))  # 8GB默认值
+  # 2. 获取物理内存（兼容不同设备格式）
+  ui_print "2/10 检测物理内存..."
+  MEM_TOTAL_KB=$(grep -i "memtotal" /proc/meminfo | awk '{print $2}')
+  if [ -z "$MEM_TOTAL_KB" ] || [ "$MEM_TOTAL_KB" -eq 0 ]; then
+      ui_print "警告：无法获取内存信息，使用默认8GB"
+      MEM_TOTAL_KB=$((8 * 1024 * 1024))
   fi
-
-  # 2. 计算内存大小（GB）
   MEM_TOTAL_GB=$((MEM_TOTAL_KB / 1024 / 1024))
-  ui_print "检测到物理内存: $MEM_TOTAL_GB GB"
+  ui_print "   系统显示内存: $MEM_TOTAL_GB GB"
 
-  # 3. 动态计算ZRAM大小（针对16GB/24GB优化）
+  # 3. 计算ZRAM大小（兼容16GB设备显示14GB的情况）
+  ui_print "3/10 计算ZRAM大小..."
   ZRAM_SIZE_MB=0
   MAX_ZRAM=0
 
-  if [ $MEM_TOTAL_GB -eq 16 ]; then
-      # 16GB设备：固定4.5GB（28%）
-      ZRAM_SIZE_MB=4500
+  # 关键优化：16GB设备（含系统显示14-15GB的情况）强制4.5GB
+  if [ $MEM_TOTAL_GB -eq 16 ] || ([ $MEM_TOTAL_GB -ge 14 ] && [ $MEM_TOTAL_GB -le 15 ]); then
+      ui_print "   检测到16GB设备（系统显示$MEM_TOTAL_GB GB），应用16GB配置"
+      ZRAM_SIZE_MB=4500  # 固定4.5GB
       MAX_ZRAM=8192
   elif [ $MEM_TOTAL_GB -ge 24 ]; then
-      # 24GB及以上：20%比例
       ZRAM_SIZE_MB=$(echo "scale=0; ($MEM_TOTAL_KB * 0.2) / 1024" | bc)
       MAX_ZRAM=10240
   else
-      # 其他内存大小的阶梯配置
       if [ $MEM_TOTAL_GB -le 4 ]; then
           ZRAM_SIZE_MB=$(echo "scale=0; ($MEM_TOTAL_KB * 0.8) / 1024" | bc)
           MAX_ZRAM=4096
       elif [ $MEM_TOTAL_GB -le 8 ]; then
           ZRAM_SIZE_MB=$(echo "scale=0; ($MEM_TOTAL_KB * 0.5) / 1024" | bc)
           MAX_ZRAM=6144
-      elif [ $MEM_TOTAL_GB -le 15 ]; then
+      elif [ $MEM_TOTAL_GB -le 13 ]; then  # 原15改为13，避免与16GB逻辑冲突
           ZRAM_SIZE_MB=$(echo "scale=0; ($MEM_TOTAL_KB * 0.3) / 1024" | bc)
           MAX_ZRAM=8192
       fi
   fi
 
-  # 兜底设置（确保合理范围）
-  if [ $ZRAM_SIZE_MB -lt 512 ]; then
+  # 兜底设置（确保不为0）
+  if [ $ZRAM_SIZE_MB -lt 512 ] || [ -z "$ZRAM_SIZE_MB" ]; then
       ZRAM_SIZE_MB=512
+      ui_print "   兜底调整ZRAM大小为: 512 MB"
   elif [ $ZRAM_SIZE_MB -gt $MAX_ZRAM ]; then
       ZRAM_SIZE_MB=$MAX_ZRAM
+      ui_print "   超出最大限制，调整为: $MAX_ZRAM MB"
   fi
+  ui_print "   最终ZRAM大小: $ZRAM_SIZE_MB MB"
 
-  ui_print "设置ZRAM大小: $ZRAM_SIZE_MB MB"
-
-  # 4. 创建设备（如不存在）
+  # 4. 清理并创建设备
+  ui_print "4/10 清理旧设备并创建新设备..."
+  if [ -e /dev/block/zram0 ]; then
+      ui_print "   发现旧设备，关闭并重置..."
+      swapoff /dev/block/zram0 >/dev/null 2>&1
+      if [ -e /sys/block/zram0/reset ]; then
+          echo 1 > /sys/block/zram0/reset >/dev/null 2>&1
+          sleep 1
+      fi
+  fi
+  # 创建设备（带错误检测）
+  if ! echo 1 > /sys/class/zram-control/hot_add; then
+      ui_print "错误：创建ZRAM设备失败！"
+      return 1
+  fi
+  sleep 2  # 等待设备节点生成
   if [ ! -e /dev/block/zram0 ]; then
-      ui_print "创建设备: /dev/block/zram0"
-      echo 1 > /sys/class/zram-control/hot_add
-      sleep 1
+      ui_print "错误：ZRAM设备节点未生成！"
+      return 1
   fi
+  ui_print "   ZRAM设备创建成功: /dev/block/zram0"
 
-  # 5. 配置ZRAM参数（强制默认LZ4）
-  echo $((ZRAM_SIZE_MB * 1024 * 1024)) > /sys/block/zram0/disksize
-  echo "lz4" > /sys/block/zram0/comp_algorithm  # 明确默认使用LZ4
-  ui_print "默认压缩算法: LZ4（未启用ZSTD）"
+  # 5. 设置ZRAM容量（带容错）
+  ui_print "5/10 设置ZRAM容量..."
+  DISKSIZE_BYTES=$(echo "$ZRAM_SIZE_MB * 1024 * 1024" | bc)
+  if ! echo $DISKSIZE_BYTES > /sys/block/zram0/disksize; then
+      ui_print "   容量设置失败，尝试降级为4GB..."
+      DISKSIZE_BYTES=$((4096 * 1024 * 1024))
+      if ! echo $DISKSIZE_BYTES > /sys/block/zram0/disksize; then
+          ui_print "错误：容量设置彻底失败！"
+          return 1
+      fi
+      ZRAM_SIZE_MB=4096
+  fi
+  ACTUAL_DISK_SIZE=$(cat /sys/block/zram0/disksize)
+  ui_print "   实际容量: $ACTUAL_DISK_SIZE 字节（约 $ZRAM_SIZE_MB MB）"
 
-  # 6. 启用LZ4快速模式（支持的内核）
+  # 6. 配置压缩算法
+  ui_print "6/10 配置压缩算法..."
+  echo "lz4" > /sys/block/zram0/comp_algorithm
+  CURRENT_ALGO=$(cat /sys/block/zram0/comp_algorithm | awk '{print $1}')
+  ui_print "   当前算法: $CURRENT_ALGO"
+
+  # 7. 启用快速模式（如支持）
+  ui_print "7/10 检查快速压缩模式..."
   if [ -e /sys/block/zram0/fast_mode ]; then
       echo 1 > /sys/block/zram0/fast_mode
-      ui_print "已启用LZ4快速压缩模式"
+      ui_print "   已启用LZ4快速模式"
+  else
+      ui_print "   不支持快速模式，跳过"
   fi
 
-  # 7. 创建设备节点（兼容处理）
+  # 8. 确认设备节点
+  ui_print "8/10 确认设备节点..."
   if [ ! -b /dev/block/zram0 ]; then
+      ui_print "   创建设备节点..."
       mknod /dev/block/zram0 b 252 0
   fi
+  ui_print "   设备节点正常"
 
-  # 8. 启用swap（高优先级）
+  # 9. 启用Swap
+  ui_print "9/10 启用ZRAM Swap..."
   mkswap /dev/block/zram0 >/dev/null 2>&1
-  swapon /dev/block/zram0 -p 100
-  ui_print "已启用ZRAM Swap（优先级100）"
+  if ! swapon /dev/block/zram0 -p 100; then
+      ui_print "   默认swapon失败，尝试busybox版本..."
+      if ! busybox swapon /dev/block/zram0 -p 100; then
+          ui_print "错误：Swap启用失败！"
+          return 1
+      fi
+  fi
 
-  # 9. 优化系统参数
-  echo 10 > /proc/sys/vm/swappiness
-  echo 1 > /proc/sys/vm/swapiness_anon
-  echo 0 > /proc/sys/vm/swapiness_file
-  ui_print "已优化内存交换参数"
-
-  # 10. 仅显示ZSTD手动切换说明（不自动切换）
-  ui_print "如需切换至ZSTD算法（手动操作）:"
-  ui_print "  1. 执行: swapoff /dev/block/zram0"
-  ui_print "  2. 执行: echo zstd > /sys/block/zram0/comp_algorithm"
-  ui_print "  3. 执行: swapon /dev/block/zram0 -p 100"
-  ui_print "===================="
-  ui_print " "
+  # 10. 最终验证
+  ui_print "10/10 验证ZRAM状态..."
+  if grep -q "zram0" /proc/swaps; then
+      ui_print "   ZRAM配置成功！状态如下："
+      cat /proc/swaps | grep zram0
+      ui_print "===== ZRAM配置完成 ====="
+      return 0
+  else
+      ui_print "错误：未检测到ZRAM生效！"
+      return 1
+  fi
 }
 
 ### AnyKernel install
@@ -181,7 +244,7 @@ ui_print "3、LZ4K"
 ui_print "4、BBR"
 ui_print "5、完美风驰驱动"
 ui_print "6、单BOOT开机"
-ui_print "7、ZRAM动态配置（默认LZ4）"  # 明确标注默认算法
+ui_print "7、ZRAM动态配置"
 ui_print "作者：Fate 酷安:Fate007"
 if [ -L "/dev/block/bootdevice/by-name/init_boot_a" ] || [ -L "/dev/block/by-name/init_boot_a" ]; then
     split_boot
@@ -191,8 +254,8 @@ else
     write_boot
 fi
 
-# 调用ZRAM配置（内核安装后执行，默认LZ4）
-zram_config &
+# 前台执行ZRAM配置，确保日志完整
+zram_config
 
 # 优先选择模块路径
 if [ -f "$AKHOME/ksu_module_susfs_1.5.2+_Release.zip" ]; then
